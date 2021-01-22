@@ -1,0 +1,617 @@
+---
+title: "Fenton z-score ~ Metabolomics"
+output: 
+  html_document:
+    df_print: paged
+    number_sections: true
+date: "`r format(Sys.Date(),'%B %d, %Y')`"
+---
+---
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(kableExtra)
+library(data.table)
+library(readxl)
+library(corrplot)
+library(ggplot2)
+library(gridExtra)
+library(tidyverse)
+library(psych)
+library(caret)
+library(ggfortify)
+library(doParallel)
+library(tidyverse)
+library(bayesSurv)
+library(GIGrvg)
+library(statmod)
+library(MCMCpack)
+library(reshape2)
+library(latex2exp)
+library(parallel)
+library(infinitefactor)
+library(viridis)
+library(robustbase)
+library(BWQS)
+library(DT)
+library(table1)
+library(Rtsne)
+library(VIM)
+library(mice)
+library(skimr)
+library(ggsci)
+library(apcluster)
+library(MASS)
+library(gclus)
+library(qgraph)
+```
+
+# Dataset
+
+## Variable description
+
+Outcome: 
+
++ **bw_z_Fenton**: birth weight for gestational age, Fenton z-score
+
+Auxiliary variables:
+
++ **hhid**: household ID (50xxx: Boston, 70xxx: NY)
++ **iid**: individual ID
++ **ch_death**: child death at some point: 0=No, 1=Yes
++ **bw**: child's birth weight (g)
++ **educ_low**: 1 = high school or less, 0 = above high school degree
++ **mbmi_prepreg**: maternal pre-pregnant BMI (kg/m^2^)
++ **parity**: number of previous births, 0=0, 1=1, 2= >1
++ **smk_preg**: maternal smoking during pregnancy: 0=no, 1=yes
++ **gestage**: gestational age at delivery (weeks)
+
+Covariates: 
+
++ **childsex**: child sex --> 0=female (reference), 1=male
++ **momrace2**: 0=white (reference), 1=black, 2=hispanic, 3=other
++ **educ**: 1= <12th grade (reference), 2= hs degree or ged, 3= some college or associates, 4= 4 years of college, 5= graduate degree
++ **age_birth**: maternal age at birth
+
+Metabolites:
+
+```{r metabolites_list, warning=FALSE, message=FALSE, echo=F}
+# Data import
+met = fread("J:/PM/Colicino_Lab/Manuscripts/2020_Metabolomics_Ferrari/Data/3_metabolites.csv")
+metabolites_list = colnames(met)[-c(1,2)]
+met_description = fread(file = "J:/PM/Colicino_Lab/Manuscripts/2020_Metabolomics_Ferrari/Data/1_metabolite-details.csv")
+met_description = met_description[comp_id %in% metabolites_list,.(comp_id, biochemical, super_pathway, 
+                                                sub_pathway, platform, chemical_id,
+                                                kegg,group_hmdb)]
+
+met_matrix_description = as.matrix(met_description[,-1,with=F])
+colnames(met_matrix_description) = c("Biochemical","Super Path",
+                                     "Sub Path","Platform","Chem ID",
+                                     "KEGG","HMDB")
+rownames(met_matrix_description) = met_description$comp_id  
+datatable(met_matrix_description, filter = 'top', options = list(
+  pageLength = 5, autoWidth = TRUE,lengthChange = FALSE))
+```
+
+## Missing Data and Imputation
+
+Summary of missing data on the covariates of interest:
+
+```{r import, echo=F, warning=FALSE, message=FALSE, fig.align='center'}
+dt = fread("J:/PM/Colicino_Lab/Manuscripts/2020_Metabolomics_Ferrari/Data/EC20190917.csv")
+dt = dt[,1:39,with=F]
+dt[,iid := ifelse(iid<10,iid*10,iid)]
+dt[,studyID_2 := paste0(hhid,"-",iid)]
+
+met = fread("J:/PM/Colicino_Lab/Manuscripts/2020_Metabolomics_Ferrari/Data/3_metabolites.csv")
+
+# Merge the two dataset
+DT = merge(dt, met, by="studyID_2")
+
+# Select only the components that we want
+metabolites_list = colnames(met)[-c(1,2)]
+covariates = c("childsex","ch_death","bw","gestage","age_birth","momrace2",
+               "educ","educ_low","mbmi_prepreg","parity","smk_preg","gestage_serum")
+outcome = c("bw_z_Fenton")
+
+# Exclude the missing outcome and the children death after birth
+DT = DT[!is.na(bw_z_Fenton),c("hhid","iid",outcome,covariates,metabolites_list),with=F]
+DT = DT[ch_death != 1]
+
+# Analize missing data for the important covariates only
+x = DT[,c(covariates[c(1,5,6,7,9,12)]),with=F]
+x = DT[,c(covariates,outcome),with=F]
+
+aggr(x, col=c('navyblue','yellow'),
+     numbers=TRUE, sortVars=TRUE, combined = FALSE,
+     labels=names(x), cex.axis=.7,
+     gap=3, ylab=c("Missing data","Pattern"))
+
+
+# Imputation with MICE package
+imputed_dataset = mice(x)
+x = complete(imputed_dataset,3)
+
+# Fill the NA value, now we have all 410 complete observation
+DT$childsex = x$childsex
+DT$age_birth = x$age_birth
+DT$momrace2 = x$momrace2
+DT$educ = x$educ
+DT$mbmi_prepreg = x$mbmi_prepreg
+DT$gestage_serum = x$gestage_serum
+ 
+# Create dummy variable for race
+DT[,':='(white = ifelse(momrace2 == 0, 1, 0),
+         black = ifelse(momrace2 == 1, 1, 0),
+         hispanic = ifelse(momrace2 == 2, 1, 0),
+         other = ifelse(momrace2 == 3, 1, 0))]
+
+DT_unscaled = copy(DT)
+# Scale and center metabolites
+cols = metabolites_list
+DT[, (cols) := lapply(.SD, scale, center = TRUE, scale = TRUE), .SDcols = cols]
+DT[, bw_z_Fenton := scale(bw_z_Fenton,center = TRUE, scale = FALSE)]
+```
+
+## Summary statistics
+
+```{r plots, echo=F, warning=FALSE, message=FALSE, fig.align='center'}
+DT_plot = DT[,c(outcome,covariates),with=F]
+DT_plot[,`Child Sex` := ifelse(childsex==0,"female","male")]
+DT_plot[educ == 1,`Maternal Education` := "<12th grade"]
+DT_plot[educ == 2,`Maternal Education` := "hs degree or ged"]
+DT_plot[educ == 3,`Maternal Education` := "some college or associates"]
+DT_plot[educ == 4,`Maternal Education` := "4 years of college"]
+DT_plot[educ == 5,`Maternal Education` := "graduate degree"]
+DT_plot[momrace2 == 0, `Maternal Race` := "white"]
+DT_plot[momrace2 == 1, `Maternal Race` := "black"]
+DT_plot[momrace2 == 2, `Maternal Race` := "hispanic"]
+DT_plot[momrace2 == 3, `Maternal Race` := "other"]
+DT_plot[, `BW Fenton z-score` := bw_z_Fenton]
+DT_plot[, `Maternal Age` := age_birth]
+table1(~ `BW Fenton z-score` + `Maternal Age` + `Child Sex` + `Maternal Education` + `Maternal Race`,
+       data=DT_plot, render.continuous=c(.="Mean", "Quantiles"="Median [Q1, Q3]"), transpose = F)
+list_plot = c(outcome,covariates)
+
+# Plot putcome distribution 
+plot(density(DT$bw_z_Fenton), xlab="",ylab="",main="Fenton z-score distribution")
+qqnorm(DT$bw_z_Fenton, main = "Normal Q-Q Plot for Fenton z-score")
+qqline(DT$bw_z_Fenton,datax = TRUE, lty=2)
+ks.test(DT$bw_z_Fenton,"pnorm")
+```
+
+## Correlation
+
+```{r corr, echo=F, warning=FALSE, message=FALSE, fig.align='center'}
+cat("Pearson correlation matrix ordered by FPC (first principal component)")
+corrplot(cor(met[,-c(1,2,NCOL(met)),with=F]), diag = FALSE, order = "FPC",
+         tl.pos = "td", tl.cex = 0.01, method = "color", type = "upper", tl.col = "white")
+
+cat("Pearson correlation matrix ordered by AOE (angular order of the eigenvectors)")
+corrplot(cor(met[,-c(1,2,NCOL(met)),with=F]), diag = FALSE, order = "AOE",
+         tl.pos = "td", tl.cex = 0.01, method = "color", type = "upper", tl.col = "white")
+
+cat("Pearson correlation matrix ordered by hclust")
+corrplot(cor(met[,-c(1,2,NCOL(met)),with=F]), diag = FALSE, order = "hclust",
+         tl.pos = "td", tl.cex = 0.01, method = "color", type = "upper", tl.col = "white")
+
+cat("Spearman correlation matrix ordered by FPC (first principal component)")
+corrplot(cor(met[,-c(1,2,NCOL(met)),with=F], method = "spearman"), diag = FALSE, order = "FPC",
+         tl.pos = "td", tl.cex = 0.01, method = "color", type = "upper", tl.col = "white")
+
+cat("Spearman correlation matrix ordered by AOE (angular order of the eigenvectors)")
+corrplot(cor(met[,-c(1,2,NCOL(met)),with=F], method = "spearman"), diag = FALSE, order = "AOE",
+         tl.pos = "td", tl.cex = 0.01, method = "color", type = "upper", tl.col = "white")
+
+cat("Spearman correlation matrix ordered by hclust")
+corrplot(cor(met[,-c(1,2,NCOL(met)),with=F], method = "spearman"), diag = FALSE, order = "hclust",
+         tl.pos = "td", tl.cex = 0.01, method = "color", type = "upper", tl.col = "white")
+```
+
+# FIN Analysis
+
+## Number of factor
+
+```{r fin,echo=F, warning=FALSE, message=FALSE, fig.align='center'}
+# Detect number of factor using PCA
+number_component = 25
+pc_met = prcomp(DT[,metabolites_list,with=F], 
+                scale = T, center = T, retx = T)
+dt_plot = data.frame(x = 1:NCOL(pc_met$rotation),y = summary(pc_met)$importance[2,])
+tk = ggplot(data = dt_plot, aes(x=x,y=y)) +
+  geom_point(aes(x=x,y=y)) + 
+  geom_line(aes(x=x,y=y)) + 
+  labs(title = "PCA Metabolites",
+       subtitle = paste0("We consider only first ",number_component," components (",
+                         round(100*summary(pc_met)$importance[3,number_component],0),
+                         "% variance explained)"),
+       caption = "Data source: Metabolomics") +
+  geom_vline(xintercept = 20, linetype = "dashed", colour = "red") + 
+  xlab('Components') + 
+  ylab('% Var explained') +
+  theme_bw() +
+  theme(plot.title = element_text(hjust = 0.5, size = 25, face = "bold"),
+        plot.subtitle = element_text(hjust = 0.5, size=15),
+        plot.caption = element_text(hjust = 1),
+        axis.text.x = element_text(size=10),
+        axis.text.y = element_text(size = 10)) 
+print(tk)
+dt_plot$cum_var = cumsum(dt_plot$y)
+colnames(dt_plot) = c("PCA_ID","Variance","Cumulative Variance")
+```
+
+## Bayesian Factor Analysis
+
+```{r analysis,echo=F, warning=FALSE, message=FALSE, fig.align='center'}
+# Run FIN analysis
+y = as.matrix(DT$bw_z_Fenton,NROW(DT$bw_z_Fenton),1)
+X = as.matrix(DT[,c(metabolites_list,covariates[c(5,7,9,12)],
+                    "white","black","other","hispanic"),with=F]) 
+nrun = 10000
+burn = 9000
+thin = 1
+k = 25
+# intdl = interactionDL(y = y, X = X, nrun = nrun, burn = burn, thin = thin, k = k)
+# saveRDS(intdl,"J:/PM/Colicino_Lab/Manuscripts/2020_Metabolomics_Ferrari/FIN_fenton_bw_25_scaled_bmi.rds")
+intdl = readRDS("J:/PM/Colicino_Lab/Manuscripts/2020_Metabolomics_Ferrari/FIN_fenton_bw_25_scaled_bmi.rds")
+
+# Rotate 
+Rotout = jointRot(intdl$lambdaSamps, intdl$etaSamps)
+mLambda = lmean(Rotout$lambda)
+rownames(mLambda) = colnames(X)
+
+# Create an array with all the simulation 
+aLambda = array(NA,dim = c(1118,25,1000))
+for(i in 1:1000){
+  aLambda[,,i] = Rotout$lambda[[i]]
+}
+
+# Calculate quantile for each component in the factor
+aLambdaq1 = apply(aLambda, c(1,2), quantile, c(0.025))
+aLambdaq2 = apply(aLambda, c(1,2), quantile, c(0.975))
+
+
+mLambda1 = as.data.table(mLambda)
+setnames(mLambda1,names(mLambda1),paste0("factor_",1:25))
+mLambda1[,names := colnames(X)]
+
+aLambdaq1 = as.data.table(aLambdaq1)
+setnames(aLambdaq1,names(aLambdaq1),paste0("factor_",1:25))
+aLambdaq1[,names := colnames(X)]
+
+aLambdaq2 = as.data.table(aLambdaq2)
+setnames(aLambdaq2,names(aLambdaq2),paste0("factor_",1:25))
+aLambdaq2[,names := colnames(X)]
+
+mLambda1 = melt(mLambda1)
+aLambdaq1 = melt(aLambdaq1)
+aLambdaq2 = melt(aLambdaq2)
+
+mLambda1 = as.data.table(mLambda1)
+aLambdaq1 = as.data.table(aLambdaq1)
+aLambdaq2 = as.data.table(aLambdaq2)
+
+aLambdaq1 = aLambdaq1[,.(names, variable=as.character(variable), value)]
+mLambda1 = mLambda1[,.(names, variable=as.character(variable), value)]
+aLambdaq2 = aLambdaq2[,.(names, variable=as.character(variable), value)]
+
+# Table of the loadings  
+data = Reduce(function(x, y) merge(x, y, 
+    by=c("names", "variable")), list(aLambdaq1,mLambda1,aLambdaq2))
+data[,check := ifelse(sign(value.x) == sign(value),1,0)]
+setnames(data,names(data),c("Metabolite","Factor","q025","mean","q975","sig"))
+data[order(sig,decreasing = T)]
+
+# --- Plot --- #
+# number of variables to include in the plot
+# take the variables with the n_var largest loadings(in absolute value)
+mLambda_met = mLambda[-which((rownames(mLambda) %in% c("age_birth","educ","mbmi_prepreg",
+                                                       "gestage_serum","white",
+                                                       "black","other","hispanic"))),]
+n_var = 1110
+max_load = apply(mLambda_met %>% abs(), 1, max)
+ind = max_load %>% order()
+mLambda_plot = mLambda[ind,]
+mLambda_plot = mLambda_plot[1:n_var,]
+
+# rearrage the rows of Lambda for interpretability
+ind_max = apply(mLambda_plot %>% abs(), 1, function(x) which(x == max(x))) %>% order()
+mat = mLambda_plot[ind_max,]
+mat = apply(mat, 2, rev)
+longmat = as.data.table(melt(mat))
+Var1 = Var2 = value = NULL
+p = ggplot(longmat, aes(x = Var2, y = Var1)) + geom_tile(aes(fill = value)) +
+  scale_fill_gradient2(low = "#3d52bf", high = "#33961b", 
+            mid = "white") + 
+  scale_x_discrete(limits = paste(1:25)) +
+  coord_cartesian(xlim = c(1.1,24.9), ylim = c(1.1,(n_var-0.1))) + 
+  xlab("Factors") + 
+  ylab("Metabolites") + 
+  ggtitle("Cluster Metabolites") + 
+  theme(axis.title.x = element_text(size=8), 
+        axis.title.y = element_text(size=8),
+        axis.text.x = element_text(size=6),
+        axis.text.y = element_blank(),
+        axis.ticks.y = element_blank(),
+        plot.title = element_text(hjust = 0.5))
+p
+
+# Create a table with significant metabolites only
+tmp_table = data.table(colnames(X),
+                       apply(intdl$mainEffectSamps,1,mean),
+                       t(apply(intdl$mainEffectSamps,1,quantile,probs = c(0.025,0.975))))
+tmp_table[,sig := ifelse(sign(`2.5%`)==sign(`97.5%`),1,0)]
+tmp_table[sig == 1 & V1 != "age_birth"]
+
+tmp = fread(file = "J:/PM/Colicino_Lab/Manuscripts/2020_Metabolomics_Ferrari/Data/1_metabolite-details.csv")
+table_sig = merge(tmp,tmp_table[,.(V1,Mean = V2,`2.5%`,`97.5%`,sig)],
+                  by.x = "comp_id", by.y = "V1")
+
+datatable(table_sig, filter = 'top', options = list(
+  pageLength = 5, autoWidth = TRUE,lengthChange = FALSE))
+
+# Plot of the significant metabolites usign FIN
+ggplot(tmp_table[sig == 1 & V1 != "age_birth"][order(V2, decreasing = T)], aes(V1,V2)) + 
+  geom_hline(yintercept=0, lty=2, lwd=1, colour="grey50") +
+  geom_errorbar(aes(ymin=`2.5%`, ymax=`97.5%`), 
+                lwd=0.5, width=0) +
+  geom_point(size=2) +
+  scale_x_discrete(limits = tmp_table[sig == 1 & V1 != "age_birth"][order(V2, decreasing = T)][,V1]) + 
+  coord_flip() +
+  guides(colour=FALSE) +
+  ggtitle("Cluster Metabolites") + 
+  labs(x="Coefficient", y="Value") +
+  theme(plot.title = element_text(hjust = 0.5),
+        panel.background = element_blank(),
+        panel.grid = element_line(color = "grey"),
+        axis.text.x = element_text(size=6),
+        axis.text.y = element_text(size=6))
+
+# Quadratic term 
+inter_m_mat = apply(intdl$omegaSamps, c(1,2), mean)
+inter_q1_mat = apply(intdl$omegaSamps, c(1,2), quantile, c(0.025))
+inter_q2_mat = apply(intdl$omegaSamps, c(1,2), quantile, c(0.975))
+
+inter_m_mat = as.data.table(inter_m_mat)
+inter_m_mat[,names := colnames(X)]
+setnames(inter_m_mat,names(inter_m_mat),c(colnames(X),"names"))
+inter_m_mat = melt(inter_m_mat)
+
+inter_q1_mat = as.data.table(inter_q1_mat)
+inter_q1_mat[,names := colnames(X)]
+setnames(inter_q1_mat,names(inter_q1_mat),c(colnames(X),"names"))
+inter_q1_mat = melt(inter_q1_mat)
+
+inter_q2_mat = as.data.table(inter_q2_mat)
+inter_q2_mat[,names := colnames(X)]
+setnames(inter_q2_mat,names(inter_q2_mat),c(colnames(X),"names"))
+inter_q2_mat = melt(inter_q2_mat)
+
+inter_m_mat = as.data.table(inter_m_mat)
+inter_q1_mat = as.data.table(inter_q1_mat)
+inter_q2_mat = as.data.table(inter_q2_mat)
+
+data_inter = Reduce(function(x, y) merge(x, y, 
+    by=c("names", "variable")), list(inter_q1_mat[,.(names, variable=as.character(variable), value)],
+                                     inter_m_mat[,.(names, variable=as.character(variable), value)],
+                                     inter_q2_mat[,.(names, variable=as.character(variable), value)]))
+data_inter[,check := ifelse(sign(value.x) == sign(value),1,0)]
+
+data_inter_tmp = data_inter[names %in% metabolites_list & variable %in% metabolites_list]
+data_inter_tmp[, value_plot := ifelse(check == 0, NA, value.y)]
+data_inter_tmp = data_inter_tmp[names %in% tmp_table[sig==1 & V1 != "age_birth",V1] & 
+                                variable %in% tmp_table[sig==1  & V1 != "age_birth",V1]]
+data_inter_tmp[, variable := factor(x = variable,
+                                    labels = tmp_table[sig == 1 & V1 != "age_birth"][order(V2, decreasing = T)][,V1])]
+data_inter_tmp[, names := factor(x = names,
+                                    labels = tmp_table[sig == 1 & V1 != "age_birth"][order(V2, decreasing = T)][,V1])]
+setkey(data_inter_tmp,names,variable)
+
+tmp_k = matrix(NA,46,46)
+tmp_k[1,] = c(rep(1,1),rep(0,45))
+for(i in 2:46){
+  tmp_k[i,] = c(rep(1,i),rep(0,46-i))
+}
+kkk = as.vector(t(tmp_k))
+data_inter_tmp[,tri_plot := kkk]
+data_inter_tmp[, value_plot := ifelse(tri_plot==1,value_plot,NA)]
+
+data_inter_tmp[,value_plot := cut(data_inter_tmp$value_plot,c(min(data_inter_tmp$value_plot,na.rm = T),
+                                                              0,5,10,
+                                                              max(data_inter_tmp$value_plot,na.rm = T)))]
+
+ggplot(data_inter_tmp, aes(names, variable, fill= value_plot)) + 
+  geom_tile() +
+  scale_y_discrete(limits = unique(data_inter_tmp$names)) +
+  scale_x_discrete(limits = rev(unique(data_inter_tmp$names))) +
+  scale_fill_manual(values=c("#f4d219","#99CCFF","#6699CC","#336699")) +
+  ggtitle("Interaction Metabolites") +
+  labs(x="", y="") +
+  theme(plot.title = element_text(hjust = 0.5),
+        panel.background = element_blank(),
+        panel.grid = element_blank(),
+        axis.text.x = element_text(size=6,angle = 90,hjust=0.95,vjust=0.2),
+        axis.text.y = element_text(size=6))
+
+# Interactions metabolites-covariates
+data_cov_tmp = data_inter
+data_cov_tmp[, value_plot := ifelse(check == 0, NA, value.y)]
+data_cov_tmp = data_cov_tmp[names %in% tmp_table[sig==1 & V1 != "age_birth",V1] & 
+                                variable %in% c(covariates[c(5,7,9,12)])]
+data_cov_tmp[, names := factor(x = names,
+                               labels = tmp_table[sig == 1 & V1 != "age_birth"][order(V2, decreasing = T)][,V1])]
+data_cov_tmp[, variable := factor(x = variable,
+                               labels = c(covariates[c(5,7,9,12)]))]
+setkey(data_cov_tmp,names)
+
+data_cov_tmp[,value_plot := cut(data_cov_tmp$value_plot,c(min(data_cov_tmp$value_plot,na.rm = T),-10,-5,0,
+                                                          5,10,
+                                                          max(data_cov_tmp$value_plot,na.rm = T)))]
+
+ggplot(data_cov_tmp, aes(y = names, x = variable, fill= value_plot)) + 
+  geom_tile() +
+  scale_fill_simpsons() + 
+  ggtitle("Interaction Metabolites-Covariates") +
+  labs(x="", y="") +
+  theme(plot.title = element_text(hjust = 0.5),
+        panel.background = element_blank(),
+        panel.grid = element_blank(),
+        axis.text.x = element_text(size=10),
+        axis.text.y = element_text(size=6))
+```
+
+```{r plot,echo=F, warning=FALSE, message=FALSE, fig.align='center'}
+dt_boxplot = melt(DT[,as.character(unique(data_cov_tmp$names)),with=F])
+
+ggplot(dt_boxplot, aes(x=variable, y=value)) + 
+  geom_boxplot(fill = "grey70",color = "black",alpha = 0.5) + 
+  scale_x_discrete(limits = unique(data_inter_tmp$names)) + 
+  coord_flip() +
+  labs(title = "Value of significant Metabolites") +
+  theme_bw() + 
+  xlab("") +
+  ylab("") +
+  theme(plot.title = element_text(hjust = 0.5, size = 20),
+        axis.text.x = element_text(size = 7),
+        axis.text.y = element_text(size = 7))
+
+cat("Pearson correlation matrix ")
+corrplot(cor(met[,tmp_table[sig == 1 & V1 != "age_birth"][order(V2, decreasing = F)][,V1],with=F]),
+                tl.col = "black", tl.cex = .5, tl.pos = "lt")
+cat("Spearman correlation matrix ")
+corrplot(cor(met[,tmp_table[sig == 1 & V1 != "age_birth"][order(V2, decreasing = F)][,V1],with=F], 
+                   method = "spearman"),
+                tl.col = "black", tl.cex = .5, tl.pos = "lt")
+
+# Create distance matrx
+met_sim_dt = as.matrix(t(DT[,table_sig[sig==1,comp_id],with=F]))
+corMat = negDistMat(met_sim_dt,r=2)
+D = corMat/min(corMat)
+spe.o = order.single(1-D)
+
+col3 <- colorRampPalette(c("red","yellow","hotpink","white", "cyan"))
+col3 <- colorRampPalette(c("black","black","white"))
+corrplot(D[spe.o,spe.o], method = "color",is.corr = F, col = col3(40), 
+         tl.col = "black", tl.cex = 0.5)	
+
+```
+
+# MWAS Analysis
+
+Here we run a single metablites analysis and we select the metabolites that are significant in both of the analysis
+
+```{r single, echo=F, warning=FALSE, message=FALSE, fig.align='center'}
+library(BAS)
+tmp = lapply(1:length(metabolites_list),function(i){
+  lm_formula = as.formula(paste0("telomere_cordblood ~ ",metabolites_list[i]," + gestage_serum + age_birth + white + black + other + hispanic + educ + mbmi_prepreg"))
+  met_bas <- bas.lm(lm_formula,
+                  data = data.frame(telomere_cordblood = y,X),
+                  prior = "BIC",
+                  modelprior = uniform())
+  lm_model = lm(lm_formula, data = data.frame(telomere_cordblood = y,X))
+  lm_table = data.frame(metabolite = metabolites_list[i],
+                        t(confint(coefficients(met_bas))[2,]),
+                        t(coefficients(summary(lm_model))[2,]),
+                        confint(lm_model, level = 0.95)[2,1],
+                        confint(lm_model, level = 0.95)[2,2])
+})
+tmp = rbindlist(tmp)
+tmp = tmp[,.(metabolite, B_estimates = beta, cri025 = X2.5., cri975 = X97.5., F_estimates = Estimate,
+             SE = `Std..Error`,`P-value` = `Pr...t..`,ci025 = confint.lm_model..level...0.95..2..1.,
+             ci975 = confint.lm_model..level...0.95..2..2.)]
+tmp[, bonf := p.adjust(tmp$`P-value`, method = "bonferroni")]
+tmp[, fdr := p.adjust(tmp$`P-value`, method = "fdr")]
+
+tmp = readRDS("J:/PM/Colicino_Lab/Manuscripts/2020_Metabolomics_Ferrari/Results/Prepreg_bmi/BW_25_scaled_mwas_all_results_bmi.rds")
+
+p = ggplot(tmp, aes(F_estimates, -log10(`P-value`))) +
+  geom_point(alpha=0.5, cex = 2, color = "grey50") +
+  geom_hline(yintercept = -log10(0.00018), linetype = 2) +
+  geom_hline(yintercept = -log10(0.05), linetype = 2) +
+  theme_bw() 
+k = p + 
+  xlab("beta") + ylab("-log10(pvalue)") +
+  ggtitle(paste0("")) +
+  labs(title = "Volcano plot metabolites",
+       subtitle = (" correction"),
+       caption = "Data source: Metabolomics") +
+  theme_bw() +
+  theme(plot.title = element_text(hjust = 0.5, size = 20, face = "bold"),
+        plot.subtitle = element_text(hjust = 0.5, size=15),
+        axis.text.x = element_text(size=10),
+        axis.text.y = element_text(size = 10)) 
+print(k)
+
+# CI single analysis metabolites 
+tmp_met_ci = tmp[metabolite %in% as.character(table_sig[sig==1,comp_id])]
+tmp_met_ci[, metabolite := factor(x = metabolite, levels = tmp_table[sig == 1 & V1 != "age_birth"][order(V2, decreasing = T)][,V1])]
+ggplot(tmp_met_ci, aes(x=F_estimates, y=metabolite)) + 
+  geom_point(size = 1) + 
+  geom_pointrange(aes(xmin=ci025, xmax=ci975), size = 0.5 ) +
+  geom_vline(xintercept = 0, lty=2, lwd=0.5, color = "grey50") + 
+  labs(title = "Metabolites Regression",
+       subtitle = "Regression one by one",
+       caption = "Data source: Metabolomics") +
+  xlab("Coefficients") + 
+  ylab("Metabolites") +
+  theme_bw() +
+  theme(plot.title = element_text(hjust = 0.5, size = 20, face = "bold"),
+        plot.subtitle = element_text(hjust = 0.5, size=15),
+        axis.text.x = element_text(size=6),
+        axis.text.y = element_text(size = 6),
+        panel.grid = element_line(color = "grey"))  
+```
+
+```{r qqplot_pvalues, echo=F, warning=FALSE, message=FALSE, fig.align='center'}
+qqplot(runif(1110),tmp$`P-value`, ylab = "Observed p-value",xlab = "Uniform p-value",
+       main = "Genomic inflation factor")
+abline(0,1,lty = 2)
+ks.test(tmp$`P-value`,'punif')
+
+#Lambda = genomic inflation factor
+pvalue <- tmp$`P-value`
+chisq <- qchisq(1 - pvalue, 1)
+lambda <- median(chisq) / qchisq(0.5, 1)
+
+# Confidence Interval
+SE.median <- qchisq(0.975, 1) * (1.253 * ( sd(chisq) / sqrt( length(chisq) ) ) )
+paste0("Lambda inflation factor: ",round(lambda,3)," (",
+       round(lambda - (SE.median / qchisq(0.5, 1)),3),"; ",
+       round(lambda + (SE.median / qchisq(0.5, 1)),3),")")
+
+
+
+```
+
+```{r scatter, echo=F, fig.width=12, fig.height=12}
+hormones = read_excel("J:/PM/Colicino_Lab/Manuscripts/2020_Metabolomics_Ferrari/Data/hormones.xlsx")
+hormones = data.table(hormones)
+hormones = hormones[complete.cases(hormones)]
+DT_scatter = DT_unscaled[,c("gestage",hormones$`Coumpound ID`),with=F]
+
+plt = vector("list",16)
+for(i in 1:NROW(hormones)){
+  DT_scatter_plot = DT_scatter[,.(gestage,value = get(hormones$`Coumpound ID`[i]))]
+  plt[[i]] = ggplot(DT_scatter_plot, aes(x = gestage, 
+                                    y = value)) + 
+    geom_point() + geom_smooth() +
+    theme_bw() + 
+    labs(title = paste0(hormones$`Coumpound ID`[i]," - ",
+                        hormones$`Super Pathway`[i]),
+         subtitle = paste0(hormones$Biochemical[i])) +
+    xlab("Gestational Age") + ylab(paste0(hormones$`Coumpound ID`[i])) +
+    theme(plot.title = element_text(hjust = 0.5, size = 15, face = "bold"),
+          plot.subtitle = element_text(hjust = 0.5,size = 8))
+}
+grid.arrange(plt[[1]],plt[[2]],plt[[3]],plt[[4]],
+             plt[[5]],plt[[6]],plt[[7]],plt[[8]],
+             plt[[9]],plt[[10]],plt[[11]],plt[[12]],
+             plt[[13]],plt[[14]],plt[[15]],plt[[16]],
+             ncol = 4, nrow = 4)
+
+
+
+```
+
+
+
+
