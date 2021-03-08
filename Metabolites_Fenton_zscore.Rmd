@@ -53,18 +53,6 @@ Outcome:
 
 + **bw_z_Fenton**: birth weight for gestational age, Fenton z-score
 
-Auxiliary variables:
-
-+ **hhid**: household ID (50xxx: Boston, 70xxx: NY)
-+ **iid**: individual ID
-+ **ch_death**: child death at some point: 0=No, 1=Yes
-+ **bw**: child's birth weight (g)
-+ **educ_low**: 1 = high school or less, 0 = above high school degree
-+ **mbmi_prepreg**: maternal pre-pregnant BMI (kg/m^2^)
-+ **parity**: number of previous births, 0=0, 1=1, 2= >1
-+ **smk_preg**: maternal smoking during pregnancy: 0=no, 1=yes
-+ **gestage**: gestational age at delivery (weeks)
-
 Covariates: 
 
 + **childsex**: child sex --> 0=female (reference), 1=male
@@ -98,14 +86,8 @@ Summary of missing data on the covariates of interest:
 
 ```{r import, echo=F, warning=FALSE, message=FALSE, fig.align='center'}
 dt = fread("J:/PM/Colicino_Lab/Manuscripts/2020_Metabolomics_Ferrari/Data/EC20190917.csv")
-dt = dt[,1:39,with=F]
-dt[,iid := ifelse(iid<10,iid*10,iid)]
-dt[,studyID_2 := paste0(hhid,"-",iid)]
 
 met = fread("J:/PM/Colicino_Lab/Manuscripts/2020_Metabolomics_Ferrari/Data/3_metabolites.csv")
-
-# Merge the two dataset
-DT = merge(dt, met, by="studyID_2")
 
 # Select only the components that we want
 metabolites_list = colnames(met)[-c(1,2)]
